@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Asmaak - لغة الإشارة</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, sans-serif;
+      margin: 0;
+      padding: 1rem;
+      background: #1a1a2e;
+      color: #eee;
+      min-height: 100vh;
+    }
+    h1 {
+      text-align: center;
+      margin-bottom: 1rem;
+      font-size: 1.5rem;
+    }
+    .container {
+      max-width: 640px;
+      margin: 0 auto;
+    }
+    .video-wrap {
+      position: relative;
+      background: #0f0f1a;
+      border-radius: 8px;
+      overflow: hidden;
+      aspect-ratio: 4/3;
+    }
+    #video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      transform: scaleX(-1);
+    }
+    #overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      transform: scaleX(-1);
+    }
+    .result {
+      margin-top: 1rem;
+      padding: 1rem;
+      background: #16213e;
+      border-radius: 8px;
+      text-align: center;
+      min-height: 4rem;
+    }
+    .result .label-ar {
+      font-size: 2rem;
+      font-weight: bold;
+      margin-bottom: 0.25rem;
+    }
+    .result .label-en {
+      font-size: 0.9rem;
+      color: #aaa;
+    }
+    .result .confidence {
+      font-size: 0.8rem;
+      color: #888;
+      margin-top: 0.25rem;
+    }
+    .result .no-sign {
+      color: #888;
+      font-style: italic;
+    }
+    .status {
+      margin-top: 0.5rem;
+      font-size: 0.85rem;
+      color: #888;
+    }
+    .error { color: #f66; }
+    button {
+      margin-top: 1rem;
+      padding: 0.5rem 1rem;
+      border: none;
+      border-radius: 6px;
+      background: #e94560;
+      color: #fff;
+      cursor: pointer;
+      font-size: 1rem;
+    }
+    button:hover { background: #c73e54; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Asmaak — التعرف على لغة الإشارة</h1>
+    <div class="video-wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <p class="status" id="status">اضغط على الزر لتشغيل الكاميرا</p>
+    <button type="button" id="btn">تشغيل الكاميرا</button>
+    <div class="result">
+      <div class="label-ar" id="labelAr"></div>
+      <div class="label-en" id="labelEn"></div>
+      <div class="confidence" id="confidence"></div>
+      <div class="no-sign" id="noSign"></div>
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const overlay = document.getElementById('overlay');
+    const statusEl = document.getElementById('status');
+    const labelAr = document.getElementById('labelAr');
+    const labelEn = document.getElementById('labelEn');
+    const confidenceEl = document.getElementById('confidence');
+    const noSignEl = document.getElementById('noSign');
+    const btn = document.getElementById('btn');
+
+    let stream = null;
+    let ws = null;
+    let sending = false;
+    let raf = null;
+    let lastLandmarks = [];
+    var predictionBuffer = [];
+    var PREDICTION_BUFFER_SIZE = 7;
+    var STABLE_THRESHOLD = 3;
+    var CONFIDENCE_THRESHOLD = 0.5;
+    var lastArabicByWord = {};
+
+    var HAND_CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]];
+    var landmarkDrawCount = 0;
+    var framesSentCount = 0;
+
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${location.host}/ws`;
+
+    function setStatus(msg, isError) {
+      if (typeof isError === 'undefined') isError = false;
+      statusEl.textContent = msg;
+      statusEl.className = isError ? 'status error' : 'status';
+    }
+
+    function resizeOverlay() {
+      if (!overlay || !video.videoWidth) return;
+      overlay.width = video.videoWidth;
+      overlay.height = video.videoHeight;
+    }
+
+    function drawLandmarks(landmarks, w, h) {
+      if (!overlay || !landmarks || landmarks.length === 0) return;
+      var ctx = overlay.getContext('2d');
+      ctx.clearRect(0, 0, w, h);
+      var points = landmarks.map(function(lm) {
+        return { x: (1 - lm[0]) * w, y: lm[1] * h };
+      });
+      ctx.strokeStyle = '#00ff88';
+      ctx.lineWidth = 2;
+      HAND_CONNECTIONS.forEach(function(pair) {
+        var a = points[pair[0]];
+        var b = points[pair[1]];
+        if (a && b) {
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+        }
+      });
+      ctx.fillStyle = '#00ff88';
+      points.forEach(function(p) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+      });
+      landmarkDrawCount++;
+      if (landmarkDrawCount % 30 === 1) console.log('[landmarks] Drawn', points.length, 'points');
+    }
+
+    function clearLandmarks() {
+      if (!overlay || !overlay.width) return;
+      overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+    }
+
+    function updateStablePrediction(labelEn, confidence) {
+      if (labelEn && confidence >= CONFIDENCE_THRESHOLD) {
+        predictionBuffer.push({ label: labelEn, confidence: confidence });
+      } else {
+        predictionBuffer.push({ label: '', confidence: 0 });
+      }
+      if (predictionBuffer.length > PREDICTION_BUFFER_SIZE) predictionBuffer.shift();
+      var counts = {};
+      predictionBuffer.forEach(function(p) {
+        if (p.label) counts[p.label] = (counts[p.label] || 0) + 1;
+      });
+      var best = '';
+      var bestCount = 0;
+      Object.keys(counts).forEach(function(l) {
+        if (counts[l] >= STABLE_THRESHOLD && counts[l] > bestCount) {
+          bestCount = counts[l];
+          best = l;
+        }
+      });
+      var last = predictionBuffer[predictionBuffer.length - 1];
+      if (last.label && last.confidence >= 0.85) best = last.label;
+      return best;
+    }
+
+    function drawFrame() {
+      if (!sending || !stream || !video.videoWidth || !ws || ws.readyState !== WebSocket.OPEN) {
+        raf = requestAnimationFrame(drawFrame);
+        return;
+      }
+      var canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      var ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0);
+      canvas.toBlob(function(blob) {
+        var reader = new FileReader();
+        reader.onload = function() {
+          var b64 = reader.result.split(',')[1];
+          if (b64) {
+            ws.send(JSON.stringify({ frame: b64 }));
+            framesSentCount++;
+            if (framesSentCount % 60 === 1) console.log('[frontend] Frame sent to backend');
+          }
+        };
+        reader.readAsDataURL(blob);
+      }, 'image/jpeg', 0.85);
+      raf = requestAnimationFrame(drawFrame);
+    }
+
+    async function startCamera() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        const msg = 'المتصفح لا يدعم الوصول إلى الكاميرا';
+        setStatus(msg, true);
+        console.error('[camera]', msg);
+        return;
+      }
+      setStatus('جاري طلب إذن الكاميرا...');
+      console.log('[camera] Requesting getUserMedia...');
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+        console.log('[camera] Camera started');
+        console.log('[camera] Webcam permission granted');
+        video.srcObject = stream;
+        try {
+          await video.play();
+          console.log('[camera] Video stream playing');
+        } catch (playErr) {
+          console.warn('[camera] video.play() failed:', playErr);
+        }
+        btn.disabled = true;
+        setStatus('جاري الاتصال بالخادم...');
+        console.log('[websocket] Connecting to', wsUrl);
+        ws = new WebSocket(wsUrl);
+        ws.onopen = function() {
+          console.log('[websocket] Connected');
+          setStatus('الكاميرا نشطة. قم بالإشارة أمام الكاميرا.');
+          sending = true;
+          drawFrame();
+        };
+        ws.onmessage = function(ev) {
+          var data = JSON.parse(ev.data);
+          if (data.error) {
+            setStatus(data.error, true);
+            console.error('[websocket] Server error:', data.error);
+            return;
+          }
+          var handDetected = data.hand_detected === true;
+          if (handDetected) {
+            setStatus('تم اكتشاف اليد');
+            console.log('[hand] Hand detected');
+          } else {
+            setStatus('لم يتم اكتشاف يد');
+            console.log('[hand] No hand detected');
+          }
+          if (data.annotated_frame) {
+            var img = new Image();
+            img.onload = function() {
+              resizeOverlay();
+              var ctx = overlay.getContext('2d');
+              ctx.save();
+              ctx.scale(-1, 1);
+              ctx.drawImage(img, -overlay.width, 0, overlay.width, overlay.height);
+              ctx.restore();
+              console.log('[frame] Annotated frame displayed');
+            };
+            img.src = 'data:image/jpeg;base64,' + data.annotated_frame;
+          }
+          var landmarks = data.landmarks || [];
+          var hasHand = landmarks.length > 0;
+          if (hasHand) lastLandmarks = landmarks;
+          else lastLandmarks = [];
+          if (data.label_en && data.label_ar) lastArabicByWord[data.label_en] = data.label_ar;
+          var stableLabel = updateStablePrediction(data.label_en || '', data.confidence || 0);
+          if (stableLabel) {
+            var ar = lastArabicByWord[stableLabel] || stableLabel;
+            labelAr.textContent = ar;
+            labelAr.classList.remove('no-sign');
+            labelEn.textContent = '(' + stableLabel + ')';
+            labelEn.classList.remove('no-sign');
+            confidenceEl.textContent = (data.confidence != null) ? 'الثقة: ' + (Math.round(data.confidence * 100)) + '%' : '';
+            confidenceEl.style.display = (data.confidence != null) ? '' : 'none';
+            noSignEl.style.display = 'none';
+            console.log('[prediction] Received:', stableLabel, 'confidence:', data.confidence);
+          } else {
+            labelAr.textContent = '';
+            labelEn.textContent = '';
+            confidenceEl.textContent = '';
+            confidenceEl.style.display = 'none';
+            noSignEl.textContent = 'لم يتم التعرف على إشارة';
+            noSignEl.style.display = 'block';
+            labelAr.classList.add('no-sign');
+          }
+        };
+        ws.onclose = function() {
+          console.log('[websocket] Closed');
+          setStatus('تم قطع الاتصال.');
+          sending = false;
+        };
+        ws.onerror = function() {
+          console.error('[websocket] Connection error');
+          setStatus('خطأ في الاتصال بالخادم.', true);
+        };
+      } catch (e) {
+        console.error('[camera] getUserMedia failed:', e.name, e.message);
+        console.error('[camera] Webcam permission denied or error');
+        if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+          setStatus('تم رفض إذن الكاميرا. يرجى السماح بالوصول في إعدادات المتصفح.', true);
+        } else if (e.name === 'NotFoundError') {
+          setStatus('لم يتم العثور على كاميرا.', true);
+        } else if (e.name === 'NotReadableError') {
+          setStatus('الكاميرا قيد الاستخدام من قبل تطبيق آخر.', true);
+        } else {
+          setStatus('خطأ: ' + (e.message || e.name), true);
+        }
+        btn.disabled = false;
+      }
+    }
+
+    btn.addEventListener('click', startCamera);
+    raf = requestAnimationFrame(drawFrame);
+  </script>
+</body>
+</html>
